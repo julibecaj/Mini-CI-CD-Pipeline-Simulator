@@ -114,8 +114,12 @@ public class PipelineExecutorService {
      * Main execution loop — runs in a worker thread from the ExecutorService (R5).
      * Fetches a fresh instance from the DB so JPA operates within this thread's context.
      */
+
     private void executeRun(Long runId) {
-        PipelineRun run = runRepository.findById(runId).orElse(null);
+        log.info(">>> EXECUTOR STARTED RUN {}", runId);
+
+
+        PipelineRun run = runRepository.findByIdWithFullGraph(runId).orElse(null);
 
         if (run == null) {
             log.error("PipelineRun {} not found.", runId);
@@ -170,74 +174,64 @@ public class PipelineExecutorService {
      * @return true if ALL jobs succeeded, false otherwise
      */
     private boolean executeStage(PipelineRun run, StageResult stageResult) {
-        stageResult.setStatus(PipelineRun.RunStatus.RUNNING);
-        stageResult.setStartedAt(Instant.now());
-        runPersistence.save(run);
-        notifyStageChanged(stageResult);
+        try {
+            stageResult.setStatus(PipelineRun.RunStatus.RUNNING);
+            stageResult.setStartedAt(Instant.now());
+            runPersistence.save(run);
+            notifyStageChanged(stageResult);
 
-        // Find the matching stage definition to get Job entities
-        Stage stageDef = run.getPipeline().getStages().stream()
-                .filter(s -> s.getName().equals(stageResult.getStageName())
-                          && s.getPosition() == stageResult.getStagePosition())
-                .findFirst()
-                .orElse(null);
+            boolean stageFailed = false;
 
-        if (stageDef == null || stageDef.getJobs().isEmpty()) {
-            stageResult.setStatus(PipelineRun.RunStatus.SUCCESS);
+            for (JobResult jobResult : stageResult.getJobResults()) {
+                jobResult.setStatus(PipelineRun.RunStatus.RUNNING);
+                jobResult.setStartedAt(Instant.now());
+                runPersistence.save(run);
+                notifyJobChanged(jobResult);
+
+                try {
+                    Job job = new Job();
+                    job.setName(jobResult.getJobName());
+                    job.setCommand(jobResult.getCommand());
+                    job.setTimeoutSeconds(60);
+
+                    jobStrategy.execute(job, jobResult);
+
+                    if (jobResult.getStatus() == PipelineRun.RunStatus.FAILED) {
+                        stageFailed = true;
+                    }
+
+                } catch (Exception ex) {
+                    jobResult.setStatus(PipelineRun.RunStatus.FAILED);
+                    jobResult.setOutput("[PIPES] Job crashed: " + ex.getMessage());
+                    jobResult.setExitCode(-1);
+                    stageFailed = true;
+                }
+
+                jobResult.setFinishedAt(Instant.now());
+                runPersistence.save(run);
+                notifyJobChanged(jobResult);
+            }
+
+            stageResult.setStatus(stageFailed
+                    ? PipelineRun.RunStatus.FAILED
+                    : PipelineRun.RunStatus.SUCCESS);
+
             stageResult.setFinishedAt(Instant.now());
             runPersistence.save(run);
-            return true;
-        }
+            notifyStageChanged(stageResult);
 
-        // R5: Submit each job as a CompletableFuture on the shared ExecutorService
-        // R3: Lambda as Supplier<Boolean>
-        List<CompletableFuture<Boolean>> futures = new ArrayList<>();
+            return !stageFailed;
 
-        for (int i = 0; i < stageDef.getJobs().size(); i++) {
-            Job job = stageDef.getJobs().get(i);
-            JobResult jobResult = stageResult.getJobResults().size() > i
-                    ? stageResult.getJobResults().get(i)
-                    : new JobResult(stageResult, job.getName(), job.getCommand());
+        } catch (Exception ex) {
+            log.error("Stage {} crashed: {}", stageResult.getStageName(), ex.getMessage(), ex);
 
-            CompletableFuture<Boolean> future = CompletableFuture.supplyAsync(
-                    () -> executeJob(run, job, jobResult),  // R3 — lambda supplier
-                    executor                                 // R5 — our thread pool
-            );
-            futures.add(future);
-        }
-
-        // R4: Stream to collect results; allOf waits for all jobs (R5)
-        CompletableFuture<Void> allJobs = CompletableFuture.allOf(
-                futures.toArray(new CompletableFuture[0]));
-
-        try {
-            allJobs.get(); // block this stage-thread until all job-threads finish
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
             stageResult.setStatus(PipelineRun.RunStatus.FAILED);
             stageResult.setFinishedAt(Instant.now());
             runPersistence.save(run);
+            notifyStageChanged(stageResult);
+
             return false;
-        } catch (ExecutionException e) {
-            log.error("Stage '{}' execution error: {}", stageResult.getStageName(), e.getMessage(), e);
         }
-
-        // R4: check if any job failed
-        boolean allSucceeded = futures.stream()
-                .map(f -> {
-                    try { return f.get(); }
-                    catch (Exception ex) { return false; }
-                })
-                .allMatch(Boolean::booleanValue);
-
-        stageResult.setStatus(allSucceeded
-                ? PipelineRun.RunStatus.SUCCESS
-                : PipelineRun.RunStatus.FAILED);
-        stageResult.setFinishedAt(Instant.now());
-        runPersistence.save(run);
-        notifyStageChanged(stageResult);
-
-        return allSucceeded;
     }
 
     /**
