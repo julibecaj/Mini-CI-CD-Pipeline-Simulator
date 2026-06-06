@@ -34,6 +34,8 @@ import java.util.stream.Collectors;
 @Service
 public class PipelineExecutorService {
 
+    private final RunPersistenceService runPersistence;
+
     private static final Logger log = LoggerFactory.getLogger(PipelineExecutorService.class);
 
     private final ExecutorService executor;
@@ -45,10 +47,11 @@ public class PipelineExecutorService {
     private final List<RunEventListener> listeners = new CopyOnWriteArrayList<>();
 
     public PipelineExecutorService(
-            @Qualifier("pipelineExecutor") ExecutorService executor,
+            RunPersistenceService runPersistence, @Qualifier("pipelineExecutor") ExecutorService executor,
             PipelineRepository pipelineRepository,
             PipelineRunRepository runRepository,
             JobExecutionStrategy jobStrategy) {
+        this.runPersistence = runPersistence;
         this.executor = executor;
         this.pipelineRepository = pipelineRepository;
         this.runRepository = runRepository;
@@ -86,7 +89,7 @@ public class PipelineExecutorService {
                 .triggeredBy("manual")
                 .build();
 
-        PipelineRun saved = runRepository.save(run);
+        PipelineRun saved = runPersistence.save(run);
 
         // Submit asynchronously so the HTTP response returns immediately (R5)
         executor.submit(() -> executeRun(saved.getId()));
@@ -109,7 +112,7 @@ public class PipelineExecutorService {
         }
 
         run.setStatus(PipelineRun.RunStatus.RUNNING);
-        runRepository.save(run);
+        runPersistence.save(run);
         notifyRunChanged(run);
 
         // R4: Stream to get stages sorted by position
@@ -122,7 +125,7 @@ public class PipelineExecutorService {
         for (StageResult stageResult : sortedStages) {
             if (pipelineFailed) {
                 stageResult.setStatus(PipelineRun.RunStatus.CANCELLED);
-                runRepository.save(run);
+                runPersistence.save(run);
                 notifyStageChanged(stageResult);
                 continue;
             }
@@ -132,7 +135,7 @@ public class PipelineExecutorService {
 
         run.setStatus(pipelineFailed ? PipelineRun.RunStatus.FAILED : PipelineRun.RunStatus.SUCCESS);
         run.setFinishedAt(Instant.now());
-        runRepository.save(run);
+        runPersistence.save(run);
         notifyRunChanged(run);
 
         log.info("Pipeline run {} finished with status {}", runId, run.getStatus());
@@ -146,7 +149,7 @@ public class PipelineExecutorService {
     private boolean executeStage(PipelineRun run, StageResult stageResult) {
         stageResult.setStatus(PipelineRun.RunStatus.RUNNING);
         stageResult.setStartedAt(Instant.now());
-        runRepository.save(run);
+        runPersistence.save(run);
         notifyStageChanged(stageResult);
 
         // Find the matching stage definition to get Job entities
@@ -159,7 +162,7 @@ public class PipelineExecutorService {
         if (stageDef == null || stageDef.getJobs().isEmpty()) {
             stageResult.setStatus(PipelineRun.RunStatus.SUCCESS);
             stageResult.setFinishedAt(Instant.now());
-            runRepository.save(run);
+            runPersistence.save(run);
             return true;
         }
 
@@ -190,7 +193,7 @@ public class PipelineExecutorService {
             Thread.currentThread().interrupt();
             stageResult.setStatus(PipelineRun.RunStatus.FAILED);
             stageResult.setFinishedAt(Instant.now());
-            runRepository.save(run);
+            runPersistence.save(run);
             return false;
         } catch (ExecutionException e) {
             log.error("Stage '{}' execution error: {}", stageResult.getStageName(), e.getMessage(), e);
@@ -208,7 +211,7 @@ public class PipelineExecutorService {
                 ? PipelineRun.RunStatus.SUCCESS
                 : PipelineRun.RunStatus.FAILED);
         stageResult.setFinishedAt(Instant.now());
-        runRepository.save(run);
+        runPersistence.save(run);
         notifyStageChanged(stageResult);
 
         return allSucceeded;
@@ -222,7 +225,7 @@ public class PipelineExecutorService {
     private boolean executeJob(PipelineRun run, Job job, JobResult jobResult) {
         jobResult.setStatus(PipelineRun.RunStatus.RUNNING);
         jobResult.setStartedAt(Instant.now());
-        runRepository.save(run);
+        runPersistence.save(run);
         notifyJobChanged(jobResult);
 
         try {
@@ -241,7 +244,7 @@ public class PipelineExecutorService {
                 icon, jobResult.getStageResult().getStageName(),
                 jobResult.getJobName(), jobResult.getExitCode()));
 
-        runRepository.save(run);
+        runPersistence.save(run);
         notifyJobChanged(jobResult);
 
         return jobResult.getStatus() == PipelineRun.RunStatus.SUCCESS;
