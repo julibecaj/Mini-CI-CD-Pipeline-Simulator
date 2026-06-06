@@ -65,4 +65,19 @@ public class RunController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> stats() {
         return ResponseEntity.ok(ApiResponse.ok(runService.dashboardStats()));
     }
+
+
+    @PostMapping("/api/runs/{runId}/cancel")
+    public ResponseEntity<ApiResponse<Void>> cancel(@PathVariable Long runId) {
+        runService.cancelRun(runId);
+        return ResponseEntity.ok(ApiResponse.ok("Run cancelled.", null));
+    }
+
+    @DeleteMapping("/api/runs/{runId}")
+    public ResponseEntity<ApiResponse<Void>> delete(@PathVariable Long runId) {
+        runService.deleteRun(runId);
+        return ResponseEntity.ok(ApiResponse.ok("Run deleted.", null));
+    }
+
+
 }

@@ -23,6 +23,7 @@ public class LocalShellStrategy implements JobExecutionStrategy {
 
     private static final Logger log = LoggerFactory.getLogger(LocalShellStrategy.class);
 
+
     @Override
     public void execute(Job job, JobResult result) throws Exception {
         result.setStartedAt(Instant.now());
@@ -34,32 +35,36 @@ public class LocalShellStrategy implements JobExecutionStrategy {
                 : new String[]{"sh", "-c", job.getCommand()};
 
         ProcessBuilder pb = new ProcessBuilder(cmd);
-        pb.redirectErrorStream(true); // merge stderr into stdout
+        pb.redirectErrorStream(true);
 
         StringBuilder output = new StringBuilder();
 
         try {
             Process process = pb.start();
 
-            // Read output line-by-line as the process runs
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
-                    log.debug("[job={}] {}", job.getName(), line);
-                }
-            }
+            Thread outputThread = new Thread(() -> {
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        output.append(line).append("\n");
+                    }
+                } catch (Exception ignored) {}
+            });
+
+            outputThread.start();
 
             boolean finished = process.waitFor(job.getTimeoutSeconds(), TimeUnit.SECONDS);
 
             if (!finished) {
                 process.destroyForcibly();
-                output.append("\n[PIPES] Job timed out after ")
-                      .append(job.getTimeoutSeconds()).append("s — killed.\n");
                 result.setExitCode(-1);
                 result.setStatus(PipelineRun.RunStatus.FAILED);
+                output.append("\n[PIPES] Job timed out after ")
+                        .append(job.getTimeoutSeconds())
+                        .append("s — killed.\n");
             } else {
+                outputThread.join(1000);
                 int exitCode = process.exitValue();
                 result.setExitCode(exitCode);
                 result.setStatus(exitCode == 0
@@ -68,11 +73,10 @@ public class LocalShellStrategy implements JobExecutionStrategy {
             }
 
         } catch (Exception ex) {
-            output.append("\n[PIPES] Failed to start process: ").append(ex.getMessage()).append("\n");
             result.setExitCode(-2);
             result.setStatus(PipelineRun.RunStatus.FAILED);
-            log.error("Process start failed for job '{}': {}", job.getName(), ex.getMessage(), ex);
-            throw ex; // re-throw so the executor knows the infrastructure failed
+            output.append("\n[PIPES] Failed: ").append(ex.getMessage()).append("\n");
+            throw ex;
         } finally {
             result.setOutput(output.toString());
             result.setFinishedAt(Instant.now());

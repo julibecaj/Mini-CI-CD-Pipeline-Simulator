@@ -107,4 +107,43 @@ public class RunService {
                 "successRate", Math.round(successRate * 10) / 10.0
         );
     }
+
+    @Transactional
+    public void deleteRun(Long runId) {
+        User user = currentUser();
+
+        PipelineRun run = runRepository.findById(runId)
+                .orElseThrow(() -> new ResourceNotFoundException("PipelineRun", runId));
+
+        if (!run.getPipeline().getOwner().getId().equals(user.getId())) {
+            throw new PipesAccessDeniedException("You do not own run " + runId);
+        }
+
+        runRepository.delete(run);
+    }
+
+    @Transactional
+    public void cancelRun(Long runId) {
+        User user = currentUser();
+
+        PipelineRun run = runRepository.findById(runId)
+                .orElseThrow(() -> new ResourceNotFoundException("PipelineRun", runId));
+
+        if (!run.getPipeline().getOwner().getId().equals(user.getId())) {
+            throw new PipesAccessDeniedException("You do not own run " + runId);
+        }
+
+        if (run.getStatus() == PipelineRun.RunStatus.SUCCESS ||
+                run.getStatus() == PipelineRun.RunStatus.FAILED ||
+                run.getStatus() == PipelineRun.RunStatus.CANCELLED) {
+            return;
+        }
+
+        run.setStatus(PipelineRun.RunStatus.CANCELLED);
+        run.setFinishedAt(java.time.Instant.now());
+        run.appendLog("[PIPES] Run cancelled by user.");
+        runRepository.save(run);
+    }
+
+
 }

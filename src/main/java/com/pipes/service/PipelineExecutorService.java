@@ -19,6 +19,9 @@ import java.util.List;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
+import com.pipes.repository.UserRepository;
+import org.springframework.security.core.context.SecurityContextHolder;
+
 /**
  * Executes pipelines asynchronously.
  *
@@ -34,6 +37,8 @@ import java.util.stream.Collectors;
 @Service
 public class PipelineExecutorService {
 
+    private final UserRepository userRepository;
+
     private final RunPersistenceService runPersistence;
 
     private static final Logger log = LoggerFactory.getLogger(PipelineExecutorService.class);
@@ -47,14 +52,17 @@ public class PipelineExecutorService {
     private final List<RunEventListener> listeners = new CopyOnWriteArrayList<>();
 
     public PipelineExecutorService(
-            RunPersistenceService runPersistence, @Qualifier("pipelineExecutor") ExecutorService executor,
+            RunPersistenceService runPersistence,
+            @Qualifier("pipelineExecutor") ExecutorService executor,
             PipelineRepository pipelineRepository,
             PipelineRunRepository runRepository,
+            UserRepository userRepository,
             JobExecutionStrategy jobStrategy) {
         this.runPersistence = runPersistence;
         this.executor = executor;
         this.pipelineRepository = pipelineRepository;
         this.runRepository = runRepository;
+        this.userRepository = userRepository;
         this.jobStrategy = jobStrategy;
     }
 
@@ -81,17 +89,20 @@ public class PipelineExecutorService {
      */
     @Transactional
     public PipelineRun trigger(Long pipelineId) {
-        Pipeline pipeline = pipelineRepository.findById(pipelineId)
+        String username = SecurityContextHolder.getContext().getAuthentication().getName();
+
+        User currentUser = userRepository.findByUsername(username)
+                .orElseThrow(() -> new ResourceNotFoundException("User", username));
+
+        Pipeline pipeline = pipelineRepository.findByIdAndOwner(pipelineId, currentUser)
                 .orElseThrow(() -> new ResourceNotFoundException("Pipeline", pipelineId));
 
-        // Builder pattern (R9) constructs the full run object graph
         PipelineRun run = PipelineRunBuilder.forPipeline(pipeline)
                 .triggeredBy("manual")
                 .build();
 
         PipelineRun saved = runPersistence.save(run);
 
-        // Submit asynchronously so the HTTP response returns immediately (R5)
         executor.submit(() -> executeRun(saved.getId()));
 
         return saved;
@@ -104,41 +115,53 @@ public class PipelineExecutorService {
      * Fetches a fresh instance from the DB so JPA operates within this thread's context.
      */
     private void executeRun(Long runId) {
-        // Each execution runs in its own thread — fetch from DB with a new transaction
         PipelineRun run = runRepository.findById(runId).orElse(null);
+
         if (run == null) {
-            log.error("PipelineRun {} not found in executor thread.", runId);
+            log.error("PipelineRun {} not found.", runId);
             return;
         }
 
-        run.setStatus(PipelineRun.RunStatus.RUNNING);
-        runPersistence.save(run);
-        notifyRunChanged(run);
+        try {
+            run.setStatus(PipelineRun.RunStatus.RUNNING);
+            runPersistence.save(run);
+            notifyRunChanged(run);
 
-        // R4: Stream to get stages sorted by position
-        List<StageResult> sortedStages = run.getStageResults().stream()
-                .sorted((a, b) -> Integer.compare(a.getStagePosition(), b.getStagePosition()))
-                .collect(Collectors.toList());
+            List<StageResult> sortedStages = run.getStageResults().stream()
+                    .sorted((a, b) -> Integer.compare(a.getStagePosition(), b.getStagePosition()))
+                    .collect(Collectors.toList());
 
-        boolean pipelineFailed = false;
+            boolean pipelineFailed = false;
 
-        for (StageResult stageResult : sortedStages) {
-            if (pipelineFailed) {
-                stageResult.setStatus(PipelineRun.RunStatus.CANCELLED);
-                runPersistence.save(run);
-                notifyStageChanged(stageResult);
-                continue;
+            for (StageResult stageResult : sortedStages) {
+                if (pipelineFailed) {
+                    stageResult.setStatus(PipelineRun.RunStatus.CANCELLED);
+                    stageResult.setFinishedAt(Instant.now());
+                    runPersistence.save(run);
+                    notifyStageChanged(stageResult);
+                    continue;
+                }
+
+                boolean stageOk = executeStage(run, stageResult);
+                if (!stageOk) {
+                    pipelineFailed = true;
+                }
             }
 
-            pipelineFailed = !executeStage(run, stageResult);
+            run.setStatus(pipelineFailed ? PipelineRun.RunStatus.FAILED : PipelineRun.RunStatus.SUCCESS);
+            run.setFinishedAt(Instant.now());
+            runPersistence.save(run);
+            notifyRunChanged(run);
+
+        } catch (Exception ex) {
+            log.error("Run {} crashed: {}", runId, ex.getMessage(), ex);
+
+            run.setStatus(PipelineRun.RunStatus.FAILED);
+            run.setFinishedAt(Instant.now());
+            run.appendLog("[PIPES] Run crashed: " + ex.getMessage());
+            runPersistence.save(run);
+            notifyRunChanged(run);
         }
-
-        run.setStatus(pipelineFailed ? PipelineRun.RunStatus.FAILED : PipelineRun.RunStatus.SUCCESS);
-        run.setFinishedAt(Instant.now());
-        runPersistence.save(run);
-        notifyRunChanged(run);
-
-        log.info("Pipeline run {} finished with status {}", runId, run.getStatus());
     }
 
     /**
