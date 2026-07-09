@@ -74,7 +74,7 @@ public class SecurityConfig {
                 // Public auth endpoints
                 .requestMatchers("/api/auth/**").permitAll()
                 // Public static frontend (served from resources/static)
-                .requestMatchers(HttpMethod.GET, "/", "/index.html", "/css/**", "/js/**").permitAll()
+                .requestMatchers(HttpMethod.GET, "/", "/index.html", "/css/**", "/js/**", "/images/**", "/previews/**").permitAll()
                 // Everything else requires a valid JWT
                 .anyRequest().authenticated()
             );
