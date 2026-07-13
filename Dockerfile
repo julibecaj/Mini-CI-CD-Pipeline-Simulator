@@ -1,25 +1,26 @@
-FROM ubuntu:latest
-LABEL authors="User"
-
-ENTRYPOINT ["top", "-b"]
-FROM eclipse-temurin:24-jdk AS build
+# Build stage
+FROM maven:3.9.9-eclipse-temurin-21 AS build
 
 WORKDIR /app
 
-COPY .mvn/ .mvn/
-COPY mvnw pom.xml ./
+COPY pom.xml .
+COPY .mvn .mvn
+COPY mvnw .
+
 RUN chmod +x mvnw
-RUN ./mvnw dependency:go-offline
+RUN ./mvnw dependency:go-offline -B
 
 COPY src ./src
+
 RUN ./mvnw clean package -DskipTests
 
-FROM eclipse-temurin:24-jre
+# Runtime stage
+FROM eclipse-temurin:21-jre
 
 WORKDIR /app
 
-COPY --from=build /app/target/*.jar app.jar
+COPY --from=build /app/target/pipes-1.0.0.jar app.jar
 
-EXPOSE 8080
+EXPOSE 10000
 
 ENTRYPOINT ["java", "-jar", "app.jar"]
